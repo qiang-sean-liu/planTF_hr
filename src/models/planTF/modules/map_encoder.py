@@ -9,6 +9,7 @@ class MapEncoder(nn.Module):
         self,
         polygon_channel=6,
         dim=128,
+        remove_global_pos=True,
     ) -> None:
         super().__init__()
 
@@ -23,21 +24,28 @@ class MapEncoder(nn.Module):
         self.traffic_light_emb = nn.Embedding(4, dim)
         self.unknown_speed_emb = nn.Embedding(1, dim)
 
+        self.remove_global_pos = remove_global_pos
+
     def forward(self, data) -> torch.Tensor:
-        polygon_center = data["map"]["polygon_center"]
-        polygon_type = data["map"]["polygon_type"].long()
-        polygon_on_route = data["map"]["polygon_on_route"].long()
-        polygon_tl_status = data["map"]["polygon_tl_status"].long()
-        polygon_has_speed_limit = data["map"]["polygon_has_speed_limit"]
-        polygon_speed_limit = data["map"]["polygon_speed_limit"]
-        point_position = data["map"]["point_position"]
-        point_vector = data["map"]["point_vector"]
-        point_orientation = data["map"]["point_orientation"]
-        valid_mask = data["map"]["valid_mask"]
+        polygon_center = data["map"]["polygon_center"]  # (bs, M, 3), where M is number of polygons, "3" is for "x", "y", "theta"
+        polygon_type = data["map"]["polygon_type"].long()  # (bs, M)
+        polygon_on_route = data["map"]["polygon_on_route"].long()  # (bs, M)
+        polygon_tl_status = data["map"]["polygon_tl_status"].long()  # (bs, M)
+        polygon_has_speed_limit = data["map"]["polygon_has_speed_limit"]  # (bs, M)
+        polygon_speed_limit = data["map"]["polygon_speed_limit"]  # (bs, M)
+        point_position = data["map"]["point_position"]  # (bs, M, 3, P, 2), where "3" is for "center", "left", "right", and "P" is number of points of each polygon
+        point_vector = data["map"]["point_vector"]  # (bs, M, 3, P, 2)
+        point_orientation = data["map"]["point_orientation"]  # (bs, M, 3, P)
+        valid_mask = data["map"]["valid_mask"]  # (bs, M, P)
+
+        if self.remove_global_pos:
+            pt_pos = point_position[:, :, 0] - polygon_center[..., None, :2]  # (bs, M, P, 2). NOTE: Left and right lanelines are NOT used ???
+        else:
+            pt_pos = point_position[:, :, 0]  # (bs, M, P, 2)
 
         polygon_feature = torch.cat(
             [
-                point_position[:, :, 0] - polygon_center[..., None, :2],
+                pt_pos,
                 point_vector[:, :, 0],
                 torch.stack(
                     [

@@ -16,6 +16,8 @@ class AgentEncoder(nn.Module):
         drop_path=0.2,
         state_attn_encoder=True,
         state_dropout=0.75,
+        use_nat=True,
+        remove_global_pos=True,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -23,10 +25,20 @@ class AgentEncoder(nn.Module):
         self.use_ego_history = use_ego_history
         self.hist_steps = hist_steps
         self.state_attn_encoder = state_attn_encoder
+        self.use_nat = use_nat
+        self.remove_global_pos = remove_global_pos
 
-        self.history_encoder = NATSequenceEncoder(
-            in_chans=history_channel, embed_dim=dim // 4, drop_path_rate=drop_path
-        )
+        if use_nat:
+            self.history_encoder = NATSequenceEncoder(
+                in_chans=history_channel, embed_dim=dim // 4, drop_path_rate=drop_path
+            )
+        else:
+            self.history_lstm = nn.LSTM(
+                input_size=history_channel,
+                hidden_size=dim,
+                batch_first=True,
+                dropout=drop_path
+            )
 
         if not use_ego_history:
             if not self.state_attn_encoder:
@@ -63,23 +75,46 @@ class AgentEncoder(nn.Module):
 
         heading_vec = self.to_vector(heading, valid_mask)
         valid_mask_vec = valid_mask[..., 1:] & valid_mask[..., :-1]
-        agent_feature = torch.cat(
-            [
-                self.to_vector(position, valid_mask),
-                self.to_vector(velocity, valid_mask),
-                torch.stack([heading_vec.cos(), heading_vec.sin()], dim=-1),
-                shape[:, :, 1:],
-                valid_mask_vec.float().unsqueeze(-1),
-            ],
-            dim=-1,
-        )
+        if self.remove_global_pos:
+            agent_feature = torch.cat(
+                [
+                    self.to_vector(position, valid_mask),
+                    self.to_vector(velocity, valid_mask),
+                    torch.stack([heading_vec.cos(), heading_vec.sin()], dim=-1),
+                    shape[:, :, 1:],
+                    valid_mask_vec.float().unsqueeze(-1),
+                ],
+                dim=-1,
+            )
+        else:
+            agent_feature = torch.cat(
+                [
+                    torch.where(
+                        valid_mask[..., 1:].unsqueeze(-1),
+                        position[:, :, 1:],
+                        torch.zeros_like(position[:, :, 1:])
+                        ),
+                    self.to_vector(velocity, valid_mask),
+                    torch.stack([heading_vec.cos(), heading_vec.sin()], dim=-1),
+                    shape[:, :, 1:],
+                    valid_mask_vec.float().unsqueeze(-1),
+                ],
+                dim=-1,
+            )
+
         bs, A, T, _ = agent_feature.shape
         agent_feature = agent_feature.view(bs * A, T, -1)
         valid_agent_mask = valid_mask.any(-1).flatten()
-
-        x_agent_tmp = self.history_encoder(
-            agent_feature[valid_agent_mask].permute(0, 2, 1).contiguous()
-        )
+        
+        if self.use_nat:
+            x_agent_tmp = self.history_encoder(
+                agent_feature[valid_agent_mask].permute(0, 2, 1).contiguous()
+            )
+        else:
+            # these couple of lines are to test using LSTM instead of NAT for history encoding
+            _, (x_agent_tmp, _) = self.history_lstm(agent_feature[valid_agent_mask])
+            x_agent_tmp = x_agent_tmp.squeeze(0)
+        
         x_agent = torch.zeros(bs * A, self.dim, device=position.device)
         x_agent[valid_agent_mask] = x_agent_tmp
         x_agent = x_agent.view(bs, A, self.dim)

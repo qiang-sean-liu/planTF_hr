@@ -35,6 +35,7 @@ class PlanningModel(TorchModuleWrapper):
         state_attn_encoder=True,
         state_dropout=0.75,
         feature_builder: NuplanFeatureBuilder = NuplanFeatureBuilder(),
+        remove_global_pos=True,
     ) -> None:
         super().__init__(
             feature_builders=[feature_builder],
@@ -46,7 +47,9 @@ class PlanningModel(TorchModuleWrapper):
         self.history_steps = history_steps
         self.future_steps = future_steps
 
-        self.pos_emb = build_mlp(4, [dim] * 2)
+        if remove_global_pos:
+            self.pos_emb = build_mlp(4, [dim] * 2)
+            
         self.agent_encoder = AgentEncoder(
             state_channel=state_channel,
             history_channel=history_channel,
@@ -56,12 +59,15 @@ class PlanningModel(TorchModuleWrapper):
             use_ego_history=use_ego_history,
             state_attn_encoder=state_attn_encoder,
             state_dropout=state_dropout,
+            remove_global_pos=remove_global_pos,
         )
 
         self.map_encoder = MapEncoder(
             dim=dim,
             polygon_channel=polygon_channel,
+            remove_global_pos=remove_global_pos,
         )
+        self.remove_global_pos = remove_global_pos
 
         self.encoder_blocks = nn.ModuleList(
             TransformerEncoderLayer(dim=dim, num_heads=num_heads, drop_path=dp)
@@ -97,26 +103,29 @@ class PlanningModel(TorchModuleWrapper):
         agent_pos = data["agent"]["position"][:, :, self.history_steps - 1]
         agent_heading = data["agent"]["heading"][:, :, self.history_steps - 1]
         agent_mask = data["agent"]["valid_mask"][:, :, : self.history_steps]
-        polygon_center = data["map"]["polygon_center"]
-        polygon_mask = data["map"]["valid_mask"]
-
-        bs, A = agent_pos.shape[0:2]
-
-        position = torch.cat([agent_pos, polygon_center[..., :2]], dim=1)
-        angle = torch.cat([agent_heading, polygon_center[..., 2]], dim=1)
-        pos = torch.cat(
-            [position, torch.stack([angle.cos(), angle.sin()], dim=-1)], dim=-1
-        )
-        pos_embed = self.pos_emb(pos)
-
-        agent_key_padding = ~(agent_mask.any(-1))
-        polygon_key_padding = ~(polygon_mask.any(-1))
-        key_padding_mask = torch.cat([agent_key_padding, polygon_key_padding], dim=-1)
+        polygon_center = data["map"]["polygon_center"]  # (bs, M, 3)
+        polygon_mask = data["map"]["valid_mask"]  # (bs, M, P)
 
         x_agent = self.agent_encoder(data)
         x_polygon = self.map_encoder(data)
 
-        x = torch.cat([x_agent, x_polygon], dim=1) + pos_embed
+        bs, A = agent_pos.shape[0:2]
+
+        if self.remove_global_pos:
+            position = torch.cat([agent_pos, polygon_center[..., :2]], dim=1)  # (bs, A+M, 2)
+            angle = torch.cat([agent_heading, polygon_center[..., 2]], dim=1)  # (bs, A+M)
+            pos = torch.cat(
+                [position, torch.stack([angle.cos(), angle.sin()], dim=-1)], dim=-1
+            )  # (bs, A+M, 4)
+            pos_embed = self.pos_emb(pos)
+
+            x = torch.cat([x_agent, x_polygon], dim=1) + pos_embed
+        else:
+            x = torch.cat([x_agent, x_polygon], dim=1)
+
+        agent_key_padding = ~(agent_mask.any(-1))
+        polygon_key_padding = ~(polygon_mask.any(-1))
+        key_padding_mask = torch.cat([agent_key_padding, polygon_key_padding], dim=-1)
 
         for blk in self.encoder_blocks:
             x = blk(x, key_padding_mask=key_padding_mask)
@@ -132,11 +141,22 @@ class PlanningModel(TorchModuleWrapper):
         }
 
         if not self.training:
-            best_mode = probability.argmax(dim=-1)
-            output_trajectory = trajectory[torch.arange(bs), best_mode]
-            angle = torch.atan2(output_trajectory[..., 3], output_trajectory[..., 2])
-            out["output_trajectory"] = torch.cat(
-                [output_trajectory[..., :2], angle.unsqueeze(-1)], dim=-1
-            )
+            try:
+                best_mode = probability.argmax(dim=-1)
+                output_trajectory = trajectory[torch.arange(bs), best_mode]
+                angle = torch.atan2(output_trajectory[..., 3], output_trajectory[..., 2])
+                out["output_trajectory"] = torch.cat(
+                    [output_trajectory[..., :2], angle.unsqueeze(-1)], dim=-1
+                )
+            except RuntimeError as e:
+                print(e)
+                print("probability", probability.shape)
+                print("trajectory", trajectory.shape)
+                print("prediction", prediction.shape)
+                print(data["agent"]["position"].shape)
+                print(data["agent"]["heading"].shape)
+                print(data["agent"]["valid_mask"].shape)
+                print(data["map"]["polygon_center"].shape)
+                print(data["map"]["valid_mask"].shape)
 
         return out
